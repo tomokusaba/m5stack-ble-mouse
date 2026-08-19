@@ -44,8 +44,6 @@ struct ImuState {
 struct PointerState {
   float smoothX = 0.0f;
   float smoothY = 0.0f;
-  float lastHorizontalTilt = 0.0f;
-  float lastVerticalTilt = 0.0f;
 };
 
 ImuState imuState;
@@ -110,10 +108,8 @@ void readImu() {
       kFilterAlpha * imuState.verticalTilt;
 }
 
-float computeAxisVelocity(float currentAngle, float previousAngle,
-                          float sensitivityMultiplier = 1.0f) {
-  const float delta = currentAngle - previousAngle;
-  const float magnitude = fabsf(delta);
+float computeTiltVelocity(float tiltAngle, float sensitivityMultiplier = 1.0f) {
+  const float magnitude = fabsf(tiltAngle);
   if (magnitude <= kDeadzoneDeg) {
     return 0.0f;
   }
@@ -122,15 +118,14 @@ float computeAxisVelocity(float currentAngle, float previousAngle,
   const float gain = kSensitivity * sensitivityMultiplier * (0.9f + normalized * 2.1f);
   const float velocity = powf(magnitude, kResponseCurve) * 0.58f * gain;
 
-  return copysignf(clampFloat(velocity, 0.0f, kMaxDelta), delta);
+  return copysignf(clampFloat(velocity, 0.0f, kMaxDelta), tiltAngle);
 }
 
 void moveMouseByImu() {
-  const float targetX = kCursorXSign * computeAxisVelocity(
-      imuState.filteredHorizontalTilt, pointerState.lastHorizontalTilt);
-  const float targetY = kCursorYSign * computeAxisVelocity(
-      imuState.filteredVerticalTilt, pointerState.lastVerticalTilt,
-      kVerticalSensitivityMultiplier);
+  const float targetX = kCursorXSign * computeTiltVelocity(
+      imuState.filteredHorizontalTilt);
+  const float targetY = kCursorYSign * computeTiltVelocity(
+      imuState.filteredVerticalTilt, kVerticalSensitivityMultiplier);
 
   pointerState.smoothX += (targetX - pointerState.smoothX) * kVelocitySmoothing;
   pointerState.smoothY += (targetY - pointerState.smoothY) * kVelocitySmoothing;
@@ -138,9 +133,6 @@ void moveMouseByImu() {
   if (bleMouse.isConnected() && (fabsf(pointerState.smoothX) > 0.05f || fabsf(pointerState.smoothY) > 0.05f)) {
     bleMouse.move(static_cast<int>(roundf(pointerState.smoothX)), static_cast<int>(roundf(pointerState.smoothY)), 0, 0);
   }
-
-  pointerState.lastHorizontalTilt = imuState.filteredHorizontalTilt;
-  pointerState.lastVerticalTilt = imuState.filteredVerticalTilt;
 }
 
 void drawStatus() {
@@ -173,8 +165,6 @@ void setup() {
   }
 
   readImu();
-  pointerState.lastHorizontalTilt = imuState.filteredHorizontalTilt;
-  pointerState.lastVerticalTilt = imuState.filteredVerticalTilt;
   pointerState.smoothX = 0.0f;
   pointerState.smoothY = 0.0f;
 
