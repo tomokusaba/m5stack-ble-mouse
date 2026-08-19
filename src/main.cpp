@@ -2,187 +2,140 @@
 #include <M5Unified.h>
 #include <BleMouse.h>
 
-constexpr float kDeadzoneDeg = 1.2f;
-constexpr float kSensitivity = 7.0f;
-constexpr float kMaxDelta = 24.0f;
-constexpr float kFilterAlpha = 0.12f;
-constexpr float kResponseCurve = 0.95f;
-constexpr float kVelocitySmoothing = 0.18f;
-constexpr uint32_t kMotionIntervalMs = 8U;
+constexpr float kTouchSensitivity = 1.8f;
+constexpr int kTouchMovementThresholdPixels = 4;
+constexpr int kMaxMouseDelta = 127;
 constexpr uint32_t kClickThresholdMs = 220U;
-constexpr float kVerticalSensitivityMultiplier = 1.75f;
-// Use -1 to reverse an axis for a device-specific calibration.
-constexpr int kCursorXSign = 1;
-constexpr int kCursorYSign = -1;
 
-static_assert(kVerticalSensitivityMultiplier > 0.0f);
-static_assert(kCursorXSign == -1 || kCursorXSign == 1);
-static_assert(kCursorYSign == -1 || kCursorYSign == 1);
+static_assert(kTouchSensitivity > 0.0f);
+static_assert(kTouchMovementThresholdPixels >= 0);
 
-struct MouseButtonState {
-  bool left = false;
-  bool pressHeld = false;
+struct TouchpadState {
+  bool active = false;
+  bool moved = false;
+  bool dragHeld = false;
 };
 
-float clampFloat(float value, float minValue, float maxValue) {
-  if (value < minValue) {
-    return minValue;
+TouchpadState touchpadState;
+BleMouse bleMouse("M5Stack CoreS3 Touchpad");
+uint32_t touchStartMs = 0;
+bool statusDrawn = false;
+bool displayedConnected = false;
+bool displayedActive = false;
+bool displayedDragHeld = false;
+
+int clampMouseDelta(int value) {
+  if (value < -kMaxMouseDelta) {
+    return -kMaxMouseDelta;
   }
-  if (value > maxValue) {
-    return maxValue;
+  if (value > kMaxMouseDelta) {
+    return kMaxMouseDelta;
   }
   return value;
 }
 
-struct ImuState {
-  float horizontalTilt = 0.0f;
-  float verticalTilt = 0.0f;
-  float filteredHorizontalTilt = 0.0f;
-  float filteredVerticalTilt = 0.0f;
-};
+bool movedBeyondTapThreshold(const m5::touch_detail_t& touch) {
+  return abs(touch.distanceX()) >= kTouchMovementThresholdPixels ||
+         abs(touch.distanceY()) >= kTouchMovementThresholdPixels;
+}
 
-struct PointerState {
-  float smoothX = 0.0f;
-  float smoothY = 0.0f;
-};
+void moveMouseByTouch(const m5::touch_detail_t& touch) {
+  const int deltaX = static_cast<int>(roundf(touch.deltaX() * kTouchSensitivity));
+  const int deltaY = static_cast<int>(roundf(touch.deltaY() * kTouchSensitivity));
 
-ImuState imuState;
-PointerState pointerState;
-MouseButtonState mouseButtonState;
-BleMouse bleMouse("M5StickS3 IMU Mouse");
-uint32_t lastMotionSampleMs = 0;
-uint32_t buttonPressStartMs = 0;
-
-void applyButtonState(bool shouldHold, uint8_t button) {
-  if (shouldHold) {
-    bleMouse.press(button);
-  } else {
-    bleMouse.release(button);
+  if (bleMouse.isConnected() && (deltaX != 0 || deltaY != 0)) {
+    bleMouse.move(clampMouseDelta(deltaX), clampMouseDelta(deltaY), 0, 0);
   }
 }
 
-void updateButtons() {
+void updateTouchpad() {
   M5.update();
+  const auto touch = M5.Touch.getDetail();
 
-  if (M5.BtnA.wasPressed()) {
-    buttonPressStartMs = millis();
-    mouseButtonState.left = true;
-    mouseButtonState.pressHeld = false;
+  if (touch.wasPressed()) {
+    touchStartMs = millis();
+    touchpadState.active = true;
+    touchpadState.moved = false;
+    touchpadState.dragHeld = false;
   }
 
-  if (M5.BtnA.isPressed() && !mouseButtonState.pressHeld &&
-      (millis() - buttonPressStartMs) >= kClickThresholdMs) {
-    mouseButtonState.pressHeld = true;
-    applyButtonState(true, MOUSE_LEFT);
+  if (touch.isPressed()) {
+    if (movedBeyondTapThreshold(touch)) {
+      touchpadState.moved = true;
+    }
+
+    if (touchpadState.moved) {
+      moveMouseByTouch(touch);
+    } else if (!touchpadState.dragHeld &&
+               (millis() - touchStartMs) >= kClickThresholdMs) {
+      bleMouse.press(MOUSE_LEFT);
+      touchpadState.dragHeld = true;
+    }
   }
 
-  if (M5.BtnA.wasReleased()) {
-    const uint32_t holdDurationMs = millis() - buttonPressStartMs;
-    if (mouseButtonState.pressHeld) {
-      applyButtonState(false, MOUSE_LEFT);
-    } else if (holdDurationMs < kClickThresholdMs) {
+  if (touch.wasReleased()) {
+    if (touchpadState.dragHeld) {
+      bleMouse.release(MOUSE_LEFT);
+    } else if (!touchpadState.moved && bleMouse.isConnected()) {
       bleMouse.click(MOUSE_LEFT);
     }
 
-    mouseButtonState.left = false;
-    mouseButtonState.pressHeld = false;
+    touchpadState.active = false;
+    touchpadState.moved = false;
+    touchpadState.dragHeld = false;
   }
 }
 
-void readImu() {
-  float ax = 0.0f;
-  float ay = 0.0f;
-  float az = 0.0f;
-
-  M5.Imu.getAccelData(&ax, &ay, &az);
-
-  // M5StickS3 portrait frame: +X is up, +Y is right, and +Z faces the user.
-  imuState.horizontalTilt = atan2f(-ay, ax) * 180.0f / PI;
-  imuState.verticalTilt = atan2f(az, sqrtf(ax * ax + ay * ay)) * 180.0f / PI;
-
-  imuState.filteredHorizontalTilt =
-      (1.0f - kFilterAlpha) * imuState.filteredHorizontalTilt +
-      kFilterAlpha * imuState.horizontalTilt;
-  imuState.filteredVerticalTilt =
-      (1.0f - kFilterAlpha) * imuState.filteredVerticalTilt +
-      kFilterAlpha * imuState.verticalTilt;
-}
-
-float computeTiltVelocity(float tiltAngle, float sensitivityMultiplier = 1.0f) {
-  const float magnitude = fabsf(tiltAngle);
-  if (magnitude <= kDeadzoneDeg) {
-    return 0.0f;
-  }
-
-  const float normalized = clampFloat((magnitude - kDeadzoneDeg) / (20.0f - kDeadzoneDeg), 0.0f, 1.0f);
-  const float gain = kSensitivity * sensitivityMultiplier * (0.9f + normalized * 2.1f);
-  const float velocity = powf(magnitude, kResponseCurve) * 0.58f * gain;
-
-  return copysignf(clampFloat(velocity, 0.0f, kMaxDelta), tiltAngle);
-}
-
-void moveMouseByImu() {
-  const float targetX = kCursorXSign * computeTiltVelocity(
-      imuState.filteredHorizontalTilt);
-  const float targetY = kCursorYSign * computeTiltVelocity(
-      imuState.filteredVerticalTilt, kVerticalSensitivityMultiplier);
-
-  pointerState.smoothX += (targetX - pointerState.smoothX) * kVelocitySmoothing;
-  pointerState.smoothY += (targetY - pointerState.smoothY) * kVelocitySmoothing;
-
-  if (bleMouse.isConnected() && (fabsf(pointerState.smoothX) > 0.05f || fabsf(pointerState.smoothY) > 0.05f)) {
-    bleMouse.move(static_cast<int>(roundf(pointerState.smoothX)), static_cast<int>(roundf(pointerState.smoothY)), 0, 0);
-  }
-}
-
-void drawStatus() {
-  M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(10, 10);
-  M5.Display.printf("BLE HID Mouse\n");
-  M5.Display.setCursor(10, 40);
-  M5.Display.printf("Conn: %s\n", bleMouse.isConnected() ? "YES" : "NO");
-  M5.Display.setCursor(10, 70);
-  M5.Display.printf("Click:%s\n", mouseButtonState.pressHeld ? "HOLD" : (mouseButtonState.left ? "ON" : "OFF"));
-}
-
-void setup() {
-  auto cfg = M5.config();
-  cfg.internal_imu = true;
-  M5.begin(cfg);
-
-  M5.Display.setBrightness(90);
+void drawInstructions() {
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
   M5.Display.setTextSize(2);
-  M5.Display.println("Starting BLE Mouse...");
+  M5.Display.setCursor(10, 10);
+  M5.Display.printf("BLE Touchpad\n");
+  M5.Display.setCursor(10, 120);
+  M5.Display.printf("Tap: click\n");
+  M5.Display.setCursor(10, 145);
+  M5.Display.printf("Swipe: move\n");
+  M5.Display.setCursor(10, 170);
+  M5.Display.printf("Hold: drag\n");
+}
 
-  if (!M5.Imu.begin()) {
-    M5.Display.println("IMU init failed");
-    while (true) {
-      delay(1000);
-    }
+void drawStatus() {
+  const bool connected = bleMouse.isConnected();
+  if (statusDrawn && connected == displayedConnected &&
+      touchpadState.active == displayedActive &&
+      touchpadState.dragHeld == displayedDragHeld) {
+    return;
   }
 
-  readImu();
-  pointerState.smoothX = 0.0f;
-  pointerState.smoothY = 0.0f;
+  M5.Display.fillRect(10, 40, 300, 55, TFT_BLACK);
+  M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(10, 40);
+  M5.Display.printf("Conn: %s\n", connected ? "YES" : "NO");
+  M5.Display.setCursor(10, 70);
+  M5.Display.printf("Touch: %s\n", touchpadState.dragHeld
+                                       ? "DRAG"
+                                       : (touchpadState.active ? "ON" : "OFF"));
 
+  statusDrawn = true;
+  displayedConnected = connected;
+  displayedActive = touchpadState.active;
+  displayedDragHeld = touchpadState.dragHeld;
+}
+
+void setup() {
+  M5.begin();
+
+  M5.Display.setBrightness(90);
   bleMouse.begin();
-  M5.Display.println("BLE HID ready");
+  drawInstructions();
+  drawStatus();
   delay(500);
 }
 
 void loop() {
-  const uint32_t now = millis();
-
-  if ((now - lastMotionSampleMs) >= kMotionIntervalMs) {
-    lastMotionSampleMs = now;
-    readImu();
-    moveMouseByImu();
-  }
-
-  updateButtons();
+  updateTouchpad();
   drawStatus();
   delay(10);
 }

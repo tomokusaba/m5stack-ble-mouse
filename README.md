@@ -1,85 +1,67 @@
-# M5StickS3 BLE HID Mouse
+# M5Stack CoreS3 BLE HID Touchpad
 
-M5StickS3 の IMU を使って、BLE HID として Windows/macOS/Linux のマウス操作を行うサンプルです。
+M5Stack CoreS3 の液晶タッチパネルを、BLE HID マウス用のタッチパッドとして使うサンプルです。
+IMU と地磁気センサーは使用しません。
 
 ## 機能
-- M5StickS3 の IMU を使って傾きでマウスを移動
-- BLE HID として PC へマウスを公開
-- 画面表示で接続状態とボタン状態を確認
-- 低速な揺れを抑えるためのデッドゾーンと平滑化
-- 短押しの左クリックと長押し中の左ドラッグ
+
+- 画面上で指をなぞると、指の移動量に応じて PC のカーソルを相対移動
+- 画面を短くタップすると左クリック
+- 画面を動かさずに長押ししてからなぞると左ドラッグ
+- BLE HID として Windows/macOS/Linux のマウスを公開
+- 画面に接続状態と現在のタッチ操作を表示
 
 ## 対応デバイス
-- M5StickS3
-- M5StickC / CPlus などの互換環境でも概ね動作可能
 
-## 必要なもの
-- M5StickS3
-- USB ケーブル
-- PlatformIO
-- Windows/macOS/Linux PC
+- M5Stack CoreS3
 
 ## 開発環境
+
 このリポジトリは PlatformIO の Arduino フレームワークを前提にしています。
 
 ```bash
-pio run -e m5stack-sticks3
+pio run -e m5stack-cores3
 ```
 
-M5StickS3 は PlatformIO の標準ボード定義に入っていない場合があるため、リポジトリには `boards/m5stack-sticks3.json` を含めています。
+CoreS3 は PlatformIO の `m5stack-cores3` ボード定義を使用します。
 
 ## 利用方法
-1. M5StickS3 を PC に接続する
-2. `pio run -e m5stack-sticks3` で書き込む
-3. PC の Bluetooth 設定で接続を許可する
-4. M5StickS3 を傾けてマウスを動かす
-5. 前面の Button A を短押しして左クリックし、長押し中は左ドラッグする
 
-## 向きとマウス操作
+1. CoreS3 を PC に接続する
+2. `pio run -e m5stack-cores3 --target upload` で書き込む
+3. PC の Bluetooth 設定で `M5Stack CoreS3 Touchpad` をペアリングする
+4. 画面をなぞってカーソルを動かす
+5. 画面をタップして左クリックする
+6. 動かさずに長押ししてから指を動かしてドラッグする
 
-通常の向きは、**画面を自分に向け、USB-C ポートを下にした縦向き**です。この向きで
-M5StickS3 の BMI270 は M5Unified を通して `+X` を画面上、`+Y` を画面右、`+Z` を
-画面手前（使用者側）として返します。
+## タッチパッドの調整
 
-- 本体上部を右へ傾ける／動かすと、カーソルは右へ移動します。
-- 本体上部を左へ傾ける／動かすと、カーソルは左へ移動します。
-- 本体上部を奥へ傾ける／動かすと、カーソルは上へ移動します。
-- 本体上部を手前へ傾ける／動かすと、カーソルは下へ移動します。
-
-縦向きの中立位置ではカーソルは停止します。傾けている間はその方向へカーソルが連続して
-移動し、傾きが大きいほど速くなります。中立位置付近の微細な揺れはデッドゾーンで抑え、
-応答曲線と速度平滑化は継続して適用されます。
-
-### 縦方向の感度
-
-上下方向は横方向の操作感を変えずに反応を高めるため、`1.75` 倍の感度を使用します。
-この値は `src/main.cpp` の次のコンパイル時定数で調整できます。大きくするほど上下方向が
-速くなりますが、最大移動量と速度平滑化は引き続き適用されます。
+タップと移動を区別する最小の指移動量は 4 画素です。指の小さな揺れでクリックが
+移動になってしまう場合は、`src/main.cpp` の `kTouchMovementThresholdPixels` を大きくしてください。
 
 ```cpp
-constexpr float kVerticalSensitivityMultiplier = 1.75f;
+constexpr int kTouchMovementThresholdPixels = 4;
 ```
 
-### 軸のキャリブレーション
-
-製造差、ライブラリ更新、または別の保持向きで方向が逆になる場合は、`src/main.cpp` の
-次のコンパイル時定数の値を `1` と `-1` で切り替えてください。
+カーソル感度は `kTouchSensitivity` で調整します。値を大きくすると、少ない指の移動で
+カーソルが遠くまで移動します。
 
 ```cpp
-constexpr int kCursorXSign = 1;   // 左右: -1 で反転
-constexpr int kCursorYSign = -1;  // 上下:  1 で反転
+constexpr float kTouchSensitivity = 1.8f;
 ```
 
-## 仕組み
-- IMU から重力ベクトルを取得して傾き角を計算する
-- 現在の傾き角を連続したカーソル速度に変換する
-- `ESP32-BLE-Mouse` ライブラリを使って BLE HID のマウスとして送出する
+長押しでドラッグを開始する時間は `kClickThresholdMs` で変更できます。
+
+```cpp
+constexpr uint32_t kClickThresholdMs = 220U;
+```
 
 ## 注意事項
-- 中立位置で止まらない場合は、`src/main.cpp` の `kDeadzoneDeg` を少し大きくしてください
-- クリックは M5StickS3 のボタン操作を簡略化した実装です
-- BLE 接続は PC 側の Bluetooth 設定でペアリングを許可する必要があります
+
+- BLE 接続は PC 側の Bluetooth 設定でペアリングを許可する必要があります。
+- タッチ中に BLE 接続が切れた場合、タップ、移動、ドラッグ操作は PC に送信されません。
 
 ## 参考
+
 - M5Unified: https://github.com/m5stack/M5Unified
 - ESP32-BLE-Mouse: https://github.com/T-vK/ESP32-BLE-Mouse
