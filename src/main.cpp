@@ -10,10 +10,12 @@ constexpr float kResponseCurve = 0.95f;
 constexpr float kVelocitySmoothing = 0.18f;
 constexpr uint32_t kMotionIntervalMs = 8U;
 constexpr uint32_t kClickThresholdMs = 220U;
+constexpr float kVerticalSensitivityMultiplier = 1.75f;
 // Use -1 to reverse an axis for a device-specific calibration.
 constexpr int kCursorXSign = 1;
 constexpr int kCursorYSign = -1;
 
+static_assert(kVerticalSensitivityMultiplier > 0.0f);
 static_assert(kCursorXSign == -1 || kCursorXSign == 1);
 static_assert(kCursorYSign == -1 || kCursorYSign == 1);
 
@@ -108,7 +110,8 @@ void readImu() {
       kFilterAlpha * imuState.verticalTilt;
 }
 
-float computeAxisVelocity(float currentAngle, float previousAngle) {
+float computeAxisVelocity(float currentAngle, float previousAngle,
+                          float sensitivityMultiplier = 1.0f) {
   const float delta = currentAngle - previousAngle;
   const float magnitude = fabsf(delta);
   if (magnitude <= kDeadzoneDeg) {
@@ -116,7 +119,7 @@ float computeAxisVelocity(float currentAngle, float previousAngle) {
   }
 
   const float normalized = clampFloat((magnitude - kDeadzoneDeg) / (20.0f - kDeadzoneDeg), 0.0f, 1.0f);
-  const float gain = kSensitivity * (0.9f + normalized * 2.1f);
+  const float gain = kSensitivity * sensitivityMultiplier * (0.9f + normalized * 2.1f);
   const float velocity = powf(magnitude, kResponseCurve) * 0.58f * gain;
 
   return copysignf(clampFloat(velocity, 0.0f, kMaxDelta), delta);
@@ -126,7 +129,8 @@ void moveMouseByImu() {
   const float targetX = kCursorXSign * computeAxisVelocity(
       imuState.filteredHorizontalTilt, pointerState.lastHorizontalTilt);
   const float targetY = kCursorYSign * computeAxisVelocity(
-      imuState.filteredVerticalTilt, pointerState.lastVerticalTilt);
+      imuState.filteredVerticalTilt, pointerState.lastVerticalTilt,
+      kVerticalSensitivityMultiplier);
 
   pointerState.smoothX += (targetX - pointerState.smoothX) * kVelocitySmoothing;
   pointerState.smoothY += (targetY - pointerState.smoothY) * kVelocitySmoothing;
