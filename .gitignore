@@ -1,0 +1,7 @@
+.pio
+.vscode
+.pioenvs
+.piolibdeps
+.clangd
+.DS_Store
+*.log
