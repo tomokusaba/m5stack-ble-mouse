@@ -10,6 +10,12 @@ constexpr float kResponseCurve = 0.95f;
 constexpr float kVelocitySmoothing = 0.18f;
 constexpr uint32_t kMotionIntervalMs = 8U;
 constexpr uint32_t kClickThresholdMs = 220U;
+// Use -1 to reverse an axis for a device-specific calibration.
+constexpr int kCursorXSign = 1;
+constexpr int kCursorYSign = -1;
+
+static_assert(kCursorXSign == -1 || kCursorXSign == 1);
+static_assert(kCursorYSign == -1 || kCursorYSign == 1);
 
 struct MouseButtonState {
   bool left = false;
@@ -27,17 +33,17 @@ float clampFloat(float value, float minValue, float maxValue) {
 }
 
 struct ImuState {
-  float roll = 0.0f;
-  float pitch = 0.0f;
-  float filteredRoll = 0.0f;
-  float filteredPitch = 0.0f;
+  float horizontalTilt = 0.0f;
+  float verticalTilt = 0.0f;
+  float filteredHorizontalTilt = 0.0f;
+  float filteredVerticalTilt = 0.0f;
 };
 
 struct PointerState {
   float smoothX = 0.0f;
   float smoothY = 0.0f;
-  float lastRoll = 0.0f;
-  float lastPitch = 0.0f;
+  float lastHorizontalTilt = 0.0f;
+  float lastVerticalTilt = 0.0f;
 };
 
 ImuState imuState;
@@ -90,11 +96,16 @@ void readImu() {
 
   M5.Imu.getAccelData(&ax, &ay, &az);
 
-  imuState.roll = atan2f(ay, az) * 180.0f / PI;
-  imuState.pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
+  // M5StickS3 portrait frame: +X is up, +Y is right, and +Z faces the user.
+  imuState.horizontalTilt = atan2f(-ay, ax) * 180.0f / PI;
+  imuState.verticalTilt = atan2f(az, sqrtf(ax * ax + ay * ay)) * 180.0f / PI;
 
-  imuState.filteredRoll = (1.0f - kFilterAlpha) * imuState.filteredRoll + kFilterAlpha * imuState.roll;
-  imuState.filteredPitch = (1.0f - kFilterAlpha) * imuState.filteredPitch + kFilterAlpha * imuState.pitch;
+  imuState.filteredHorizontalTilt =
+      (1.0f - kFilterAlpha) * imuState.filteredHorizontalTilt +
+      kFilterAlpha * imuState.horizontalTilt;
+  imuState.filteredVerticalTilt =
+      (1.0f - kFilterAlpha) * imuState.filteredVerticalTilt +
+      kFilterAlpha * imuState.verticalTilt;
 }
 
 float computeAxisVelocity(float currentAngle, float previousAngle) {
@@ -112,8 +123,10 @@ float computeAxisVelocity(float currentAngle, float previousAngle) {
 }
 
 void moveMouseByImu() {
-  const float targetX = computeAxisVelocity(imuState.filteredRoll, pointerState.lastRoll);
-  const float targetY = -computeAxisVelocity(imuState.filteredPitch, pointerState.lastPitch);
+  const float targetX = kCursorXSign * computeAxisVelocity(
+      imuState.filteredHorizontalTilt, pointerState.lastHorizontalTilt);
+  const float targetY = kCursorYSign * computeAxisVelocity(
+      imuState.filteredVerticalTilt, pointerState.lastVerticalTilt);
 
   pointerState.smoothX += (targetX - pointerState.smoothX) * kVelocitySmoothing;
   pointerState.smoothY += (targetY - pointerState.smoothY) * kVelocitySmoothing;
@@ -122,8 +135,8 @@ void moveMouseByImu() {
     bleMouse.move(static_cast<int>(roundf(pointerState.smoothX)), static_cast<int>(roundf(pointerState.smoothY)), 0, 0);
   }
 
-  pointerState.lastRoll = imuState.filteredRoll;
-  pointerState.lastPitch = imuState.filteredPitch;
+  pointerState.lastHorizontalTilt = imuState.filteredHorizontalTilt;
+  pointerState.lastVerticalTilt = imuState.filteredVerticalTilt;
 }
 
 void drawStatus() {
@@ -156,8 +169,8 @@ void setup() {
   }
 
   readImu();
-  pointerState.lastRoll = imuState.filteredRoll;
-  pointerState.lastPitch = imuState.filteredPitch;
+  pointerState.lastHorizontalTilt = imuState.filteredHorizontalTilt;
+  pointerState.lastVerticalTilt = imuState.filteredVerticalTilt;
   pointerState.smoothX = 0.0f;
   pointerState.smoothY = 0.0f;
 
