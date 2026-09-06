@@ -2,6 +2,12 @@
 #include <M5Unified.h>
 #include <BleMouse.h>
 
+#if defined(TARGET_M5STACK_CORES3)
+#include "CoreAirMouse.h"
+#include <freertos/semphr.h>
+#include <utility/imu/BMI270_Class.hpp>
+#endif
+
 #if !defined(TARGET_M5STICKS3) && !defined(TARGET_M5STACK_CORES3)
 #error "Select m5stack-sticks3 or m5stack-cores3 in PlatformIO."
 #endif
@@ -151,17 +157,9 @@ void loop() {
 
 #else
 
-// M5Unified returns CoreS3 axes as +X right, +Y toward the top, +Z out of the display.
-constexpr float kAirMouseDeadzoneDps = 2.0f;
-constexpr float kAirMousePixelsPerDps = 0.045f;
-constexpr float kAirMouseSmoothing = 0.22f;
-constexpr float kGravityMinimumG = 0.70f;
-constexpr float kGravityMaximumG = 1.30f;
-constexpr float kMinimumUprightGravityG = 0.30f;
-constexpr float kShakeThresholdG = 1.75f;
-constexpr uint32_t kShakeCooldownMs = 900U;
-constexpr int kAirMouseXSign = 1;
-constexpr int kAirMouseYSign = -1;
+namespace air = core_air_mouse;
+constexpr uint32_t kTouchPollUs = 5000;
+constexpr uint32_t kStatusIntervalMs = 200;
 
 constexpr float kTrackpadSensitivity = 1.55f;
 constexpr float kScrollSensitivity = 0.18f;
@@ -176,20 +174,8 @@ constexpr int kClapPeakThreshold = 9000;
 constexpr uint32_t kClapCooldownMs = 500U;
 constexpr size_t kClapSampleCount = 64;
 
-static_assert(kAirMouseXSign == -1 || kAirMouseXSign == 1);
-static_assert(kAirMouseYSign == -1 || kAirMouseYSign == 1);
-static_assert(kGravityMinimumG < kGravityMaximumG);
 static_assert(kTrackpadSensitivity > 0.0f);
-
-struct AirMouseState {
-  float smoothX = 0.0f;
-  float smoothY = 0.0f;
-  float magneticHeadingDeg = 0.0f;
-  bool pointingEnabled = true;
-  bool gravityStable = false;
-  bool upright = false;
-  bool magnetometerAvailable = false;
-};
+static_assert(pdMS_TO_TICKS(air::kImuPollMs) > 0, "IMU polling requires a <=2ms RTOS tick");
 
 struct TouchGestureState {
   bool active = false;
@@ -198,7 +184,13 @@ struct TouchGestureState {
   uint32_t startedMs = 0;
 };
 
-AirMouseState airMouse;
+air::Controller airMouse;
+SemaphoreHandle_t airMouseMutex = nullptr;
+bool imuHealthy = true;
+uint32_t imuSampleRateHz = 0;
+bool magnetometerAvailable = false;
+float magneticHeadingDeg = 0;
+bool micHealthy = false;
 TouchGestureState touchGesture;
 BleMouse bleMouse("M5Stack CoreS3 Sensor Mouse");
 bool dragLockEnabled = false;
@@ -207,9 +199,158 @@ bool virtualMiddleHeld = false;
 bool virtualRightHeld = false;
 bool leftButtonPressed = false;
 bool holdToggleCaptured = false;
-uint32_t lastShakeMs = 0;
 uint32_t lastClapMs = 0;
 uint32_t lastStatusDrawMs = 0;
+uint32_t lastTouchPollUs = 0;
+uint32_t lastReportUs = 0;
+
+void coreFatal(const char* message) {
+  Serial.println(message);
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 8);
+  M5.Display.println(message);
+  while (true) {
+    delay(1000);
+  }
+}
+
+bool configureCoreImu() {
+  using Bmi = m5::BMI270_Class;
+  auto* sensor = M5.Imu.getImuInstancePtr(0);
+  if (!sensor || M5.Imu.getType() != m5::imu_bmi270) {
+    return false;
+  }
+  // Bosch ACC_CONF/GYR_CONF: 400Hz, normal bandwidth, performance mode.
+  // Preserve the 8g / 2000dps ranges used by M5Unified's conversion factors.
+  const uint8_t config[] = {0xAA, 0x02, 0xEA, 0x00};
+  uint8_t actual[sizeof(config)] = {};
+  if (!sensor->writeRegister(Bmi::ACC_CONF_ADDR, config, sizeof(config)) ||
+      !sensor->readRegister(Bmi::ACC_CONF_ADDR, actual, sizeof(actual)) ||
+      memcmp(config, actual, sizeof(config)) != 0) {
+    return false;
+  }
+  M5.Imu.setCalibration(0, 0, 0);
+  // Do not inherit a one-sample/NVS gyro bias; the new pipeline calibrates at rest.
+  for (size_t index = 3; index < 6; ++index) {
+    M5.Imu.setOffsetData(index, 0);
+  }
+  return M5.Imu.setAxisOrder(m5::IMU_Class::axis_x_pos, m5::IMU_Class::axis_y_pos,
+                             m5::IMU_Class::axis_z_pos);
+}
+
+void sampleAirMouseTask(void*) {
+  TickType_t wake = xTaskGetTickCount();
+  uint32_t lastGoodUs = micros();
+  uint32_t lastMagUs = 0;
+  uint32_t lastAccelUs = 0;
+  uint32_t rateWindowUs = lastGoodUs;
+  uint32_t sampleCount = 0;
+  air::Vec3 accel;
+  bool haveAccel = false;
+  for (;;) {
+    // This mutex also covers M5.update(): touch and IMU share the internal I2C bus.
+    xSemaphoreTake(airMouseMutex, portMAX_DELAY);
+    const auto updated = M5.Imu.update();
+    const uint32_t now = micros();
+    const auto data = M5.Imu.getImuData();
+    if (updated & m5::IMU_Class::sensor_mask_accel) {
+      accel = {data.accel.x, data.accel.y, data.accel.z};
+      haveAccel = true;
+      lastAccelUs = now;
+    }
+    if ((updated & m5::IMU_Class::sensor_mask_gyro) && haveAccel &&
+        now - lastAccelUs <= air::kMaxSampleGapUs) {
+      const air::Vec3 gyro(data.gyro.x, data.gyro.y, data.gyro.z);
+      if (air::finite(accel) && air::finite(gyro)) {
+        airMouse.sample(gyro, accel, now);
+        lastGoodUs = now;
+        ++sampleCount;
+        if (!imuHealthy) {
+          Serial.println("IMU samples recovered");
+        }
+        imuHealthy = true;
+      }
+    }
+    if (now - lastGoodUs > air::kMaxSampleGapUs) {
+      if (imuHealthy) {
+        Serial.println("IMU samples missing: pointing stopped");
+      }
+      imuHealthy = false;
+      airMouse.clearMotion();
+    }
+    if (now - rateWindowUs >= 1000000U) {
+      imuSampleRateHz = static_cast<uint32_t>(
+          static_cast<uint64_t>(sampleCount) * 1000000U / (now - rateWindowUs));
+      sampleCount = 0;
+      rateWindowUs = now;
+    }
+    if (updated & m5::IMU_Class::sensor_mask_mag) {
+      lastMagUs = now;
+      const air::Vec3 mag(data.mag.x, data.mag.y, data.mag.z);
+      magnetometerAvailable = air::finite(mag) && air::length(mag) > 0.01f;
+      if (magnetometerAvailable) {
+        const auto g = airMouse.gravity;
+        const float roll = atan2f(g.y, g.z);
+        const float pitch = atan2f(-g.x, sqrtf(g.y * g.y + g.z * g.z));
+        const float fieldX = mag.x * cosf(pitch) + mag.z * sinf(pitch);
+        const float fieldY = mag.x * sinf(roll) * sinf(pitch) +
+                             mag.y * cosf(roll) - mag.z * sinf(roll) * cosf(pitch);
+        magneticHeadingDeg = atan2f(fieldY, fieldX) * 180.0f / PI;
+        if (magneticHeadingDeg < 0) {
+          magneticHeadingDeg += 360.0f;
+        }
+      }
+    } else if (now - lastMagUs > 500000U) {
+      magnetometerAvailable = false;
+    }
+    xSemaphoreGive(airMouseMutex);
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(air::kImuPollMs));
+  }
+}
+
+bool touchingOrButtonHeld() {
+  for (uint8_t i = 0; i < M5.Touch.getCount(); ++i) {
+    if (M5.Touch.getDetail(i).isPressed()) {
+      return true;
+    }
+  }
+  return M5.BtnA.isPressed() || M5.BtnB.isPressed() || M5.BtnC.isPressed();
+}
+
+void reportAirMouse() {
+  const uint32_t now = micros();
+  if (now - lastReportUs < air::kReportIntervalUs) {
+    return;
+  }
+  lastReportUs = now;
+  int dx = 0, dy = 0;
+  const bool connected = bleMouse.isConnected();
+  xSemaphoreTake(airMouseMutex, portMAX_DELAY);
+  airMouse.setInput(touchingOrButtonHeld(), connected, now);
+  if (imuHealthy && !airMouse.blocked(now)) {
+    dx = air::PixelAccumulator::take(airMouse.pending.x);
+    dy = air::PixelAccumulator::take(airMouse.pending.y);
+  } else {
+    airMouse.clearMotion();
+  }
+  xSemaphoreGive(airMouseMutex);
+  if (connected && (dx || dy)) {
+    bleMouse.move(static_cast<signed char>(dx), static_cast<signed char>(dy));
+  }
+}
+
+void coreClick(uint8_t button) {
+  xSemaphoreTake(airMouseMutex, portMAX_DELAY);
+  airMouse.freeze(micros());
+  xSemaphoreGive(airMouseMutex);
+  // BleMouse::click clears all held buttons, including the drag lock.
+  if (bleMouse.isConnected() && !bleMouse.isPressed(button)) {
+    bleMouse.press(button);
+    bleMouse.release(button);
+  }
+}
 
 int trackpadBottomY() {
   return M5.Display.height() - kVirtualButtonBarHeight - kHoldToggleHeight;
@@ -237,72 +378,12 @@ void syncLeftButton() {
   leftButtonPressed = shouldPress;
 }
 
-void clearAirMouseMotion() {
-  airMouse.smoothX = 0.0f;
-  airMouse.smoothY = 0.0f;
-}
-
-void updateAirMouse() {
-  float ax = 0.0f;
-  float ay = 0.0f;
-  float az = 0.0f;
-  float gx = 0.0f;
-  float gy = 0.0f;
-  float gz = 0.0f;
-  M5.Imu.getAccelData(&ax, &ay, &az);
-  M5.Imu.getGyroData(&gx, &gy, &gz);
-
-  const float gravityG = sqrtf(ax * ax + ay * ay + az * az);
-  airMouse.gravityStable = gravityG >= kGravityMinimumG && gravityG <= kGravityMaximumG;
-  airMouse.upright = fabsf(ay) >= kMinimumUprightGravityG;
-
-  float mx = 0.0f;
-  float my = 0.0f;
-  float mz = 0.0f;
-  airMouse.magnetometerAvailable = M5.Imu.getMag(&mx, &my, &mz);
-  if (airMouse.magnetometerAvailable) {
-    const float roll = atan2f(ay, az);
-    const float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
-    const float horizontalFieldX = mx * cosf(pitch) + mz * sinf(pitch);
-    const float horizontalFieldY =
-        mx * sinf(roll) * sinf(pitch) + my * cosf(roll) - mz * sinf(roll) * cosf(pitch);
-    airMouse.magneticHeadingDeg = atan2f(horizontalFieldY, horizontalFieldX) * 180.0f / PI;
-    if (airMouse.magneticHeadingDeg < 0.0f) {
-      airMouse.magneticHeadingDeg += 360.0f;
-    }
-  }
-
-  if (gravityG >= kShakeThresholdG && millis() - lastShakeMs >= kShakeCooldownMs) {
-    airMouse.pointingEnabled = !airMouse.pointingEnabled;
-    lastShakeMs = millis();
-    clearAirMouseMotion();
-  }
-
-  const float angularSpeedDps = sqrtf(gx * gx + gy * gy);
-  if (!airMouse.pointingEnabled || !airMouse.gravityStable || !airMouse.upright ||
-      angularSpeedDps <= kAirMouseDeadzoneDps) {
-    clearAirMouseMotion();
-    return;
-  }
-
-  const float targetX = kAirMouseXSign * gy * kAirMousePixelsPerDps;
-  const float targetY = kAirMouseYSign * gx * kAirMousePixelsPerDps;
-  airMouse.smoothX += (targetX - airMouse.smoothX) * kAirMouseSmoothing;
-  airMouse.smoothY += (targetY - airMouse.smoothY) * kAirMouseSmoothing;
-
-  if (bleMouse.isConnected() &&
-      (fabsf(airMouse.smoothX) >= 0.5f || fabsf(airMouse.smoothY) >= 0.5f)) {
-    bleMouse.move(static_cast<signed char>(clampHidDelta(roundf(airMouse.smoothX))),
-                  static_cast<signed char>(clampHidDelta(roundf(airMouse.smoothY))));
-  }
-}
-
 void finishTouchGesture() {
   if (!touchGesture.moved && bleMouse.isConnected()) {
     if (touchGesture.twoFinger || millis() - touchGesture.startedMs >= kClickThresholdMs) {
-      bleMouse.click(MOUSE_RIGHT);
+      coreClick(MOUSE_RIGHT);
     } else {
-      bleMouse.click(MOUSE_LEFT);
+      coreClick(MOUSE_LEFT);
     }
   }
   touchGesture = {};
@@ -315,7 +396,7 @@ void updateTrackpad() {
 
   for (uint8_t index = 0; index < M5.Touch.getCount(); ++index) {
     const auto& touch = M5.Touch.getDetail(index);
-    if (!isInTrackpad(touch)) {
+    if (!touch.isPressed() || !isInTrackpad(touch)) {
       continue;
     }
     if (firstTouch == nullptr) {
@@ -397,7 +478,7 @@ void updateVirtualButton(m5::Button_Class& button, uint8_t mouseButton, bool& he
       bleMouse.release(mouseButton);
     }
   } else if (button.wasClicked() && bleMouse.isConnected()) {
-    bleMouse.click(mouseButton);
+    coreClick(mouseButton);
   }
 }
 
@@ -408,24 +489,26 @@ void updateVirtualButtons() {
 }
 
 void updateClapClick() {
-  if (!kEnableClapClick || !M5.Mic.isEnabled()) {
+  if (!kEnableClapClick || !micHealthy || M5.Mic.isRecording()) {
     return;
   }
 
   static int16_t samples[kClapSampleCount];
-  if (!M5.Mic.record(samples, kClapSampleCount)) {
-    return;
-  }
-
-  int peak = 0;
-  for (const auto sample : samples) {
-    peak = max(peak, abs(static_cast<int>(sample)));
-  }
-  if (peak >= kClapPeakThreshold && millis() - lastClapMs >= kClapCooldownMs) {
-    if (bleMouse.isConnected()) {
-      bleMouse.click(MOUSE_LEFT);
+  static bool recorded = false;
+  if (recorded) {
+    int peak = 0;
+    for (const auto sample : samples) {
+      peak = max(peak, abs(static_cast<int>(sample)));
     }
-    lastClapMs = millis();
+    if (peak >= kClapPeakThreshold && millis() - lastClapMs >= kClapCooldownMs) {
+      coreClick(MOUSE_LEFT);
+      lastClapMs = millis();
+    }
+  }
+  recorded = M5.Mic.record(samples, kClapSampleCount);
+  if (!recorded) {
+    Serial.println("Mic recording failed: clap disabled");
+    micHealthy = false;
   }
 }
 
@@ -460,19 +543,36 @@ void drawCoreUi() {
 }
 
 void drawCoreStatus() {
-  if (millis() - lastStatusDrawMs < 200U) {
+  if (millis() - lastStatusDrawMs < kStatusIntervalMs) {
     return;
   }
   lastStatusDrawMs = millis();
-  M5.Display.fillRect(4, 4, M5.Display.width() - 8, 22, TFT_BLACK);
+  xSemaphoreTake(airMouseMutex, portMAX_DELAY);
+  const char* airStatus = !imuHealthy ? "ERROR" : !airMouse.calibrated ? "CAL" :
+                         !airMouse.pointingEnabled ? "PAUSE" :
+                         airMouse.blocked(micros()) ? "FREEZE" : "ON";
+  const bool calibrating = !airMouse.calibrated;
+  const uint32_t retries = airMouse.calibrationRetries;
+  const bool magAvailable = magnetometerAvailable;
+  const float heading = magneticHeadingDeg;
+  const bool fallback = airMouse.gravityFallback;
+  const uint32_t sampleRateHz = imuSampleRateHz;
+  xSemaphoreGive(airMouseMutex);
+  M5.Display.fillRect(4, 4, M5.Display.width() - 8, 38, TFT_BLACK);
   M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
   M5.Display.setTextSize(1);
   M5.Display.setCursor(8, 8);
   M5.Display.printf("BLE:%s AIR:%s MAG:%s %03.0f",
                     bleMouse.isConnected() ? "ON" : "WAIT",
-                    airMouse.pointingEnabled ? "ON" : "PAUSE",
-                    airMouse.magnetometerAvailable ? "OK" : "--",
-                    airMouse.magneticHeadingDeg);
+                    airStatus, magAvailable ? "OK" : "--", heading);
+  M5.Display.setCursor(8, 24);
+  if (calibrating) {
+    M5.Display.printf("Calibrating... Keep still! Retry:%lu", static_cast<unsigned long>(retries));
+  } else {
+    M5.Display.printf("%luHz / %s / MIC:%s", static_cast<unsigned long>(sampleRateHz),
+                      fallback ? "BODY AXES" : "ROLL COMP",
+                      !kEnableClapClick ? "OFF" : micHealthy ? "ON" : "ERROR");
+  }
   M5.Display.fillRect(4, trackpadBottomY() + 2, M5.Display.width() - 8, 18, TFT_BLACK);
   M5.Display.setTextColor(dragLockEnabled ? TFT_RED : TFT_YELLOW, TFT_BLACK);
   M5.Display.setCursor(8, trackpadBottomY() + 10);
@@ -493,32 +593,45 @@ void setup() {
   M5.BtnB.setHoldThresh(kVirtualButtonHoldMs);
   M5.BtnC.setHoldThresh(kVirtualButtonHoldMs);
 
-  if (!M5.Imu.isEnabled() && !M5.Imu.begin()) {
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-    M5.Display.println("IMU init failed");
-    while (true) {
-      delay(1000);
-    }
+  if (!configureCoreImu()) {
+    coreFatal("BMI270 configuration failed");
   }
-  if (kEnableClapClick && M5.Mic.isEnabled() && !M5.Mic.begin()) {
-    M5.Display.println("Mic init failed");
+  airMouseMutex = xSemaphoreCreateMutex();
+  if (!airMouseMutex) {
+    coreFatal("IMU mutex allocation failed");
+  }
+  if (kEnableClapClick) {
+    micHealthy = M5.Mic.isEnabled() && M5.Mic.begin();
+    if (!micHealthy) {
+      Serial.println("Mic init failed: clap disabled");
+    }
   }
 
   bleMouse.begin();
   drawCoreUi();
+  lastStatusDrawMs = millis() - kStatusIntervalMs;
   drawCoreStatus();
+  if (xTaskCreate(sampleAirMouseTask, "air-imu", 4096, nullptr, 2, nullptr) != pdPASS) {
+    coreFatal("IMU task allocation failed");
+  }
 }
 
 void loop() {
-  M5.update();
-  updateAirMouse();
-  updateTrackpad();
-  updateHoldToggle();
-  updateVirtualButtons();
+  const uint32_t now = micros();
+  if (now - lastTouchPollUs >= kTouchPollUs) {
+    lastTouchPollUs = now;
+    xSemaphoreTake(airMouseMutex, portMAX_DELAY);
+    M5.update();
+    airMouse.setInput(touchingOrButtonHeld(), bleMouse.isConnected(), micros());
+    xSemaphoreGive(airMouseMutex);
+    updateTrackpad();
+    updateHoldToggle();
+    updateVirtualButtons();
+  }
+  reportAirMouse();
   updateClapClick();
   drawCoreStatus();
-  delay(8);
+  delay(1);
 }
 
 #endif
