@@ -176,6 +176,11 @@ class Controller {
            hasInteraction_ || hasShaken_;
   }
 
+  bool freezeActive(uint32_t now) {
+    blocked(now);
+    return interacting_ || hasInteraction_ || hasShaken_;
+  }
+
   void sample(Vec3 rawGyro, Vec3 accel, uint32_t now) {
     const uint32_t elapsedUs = now - previousSampleUs_;
     const bool gap = !hasSample_ || elapsedUs > kMaxSampleGapUs;

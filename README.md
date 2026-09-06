@@ -15,6 +15,15 @@ CoreS3 は PlatformIO 標準の `m5stack-cores3` 定義（ESP32-S3、16 MB フ�
 M5StickS3 用の 8 MB ボード定義は `boards/m5stack-sticks3.json` に含めています。
 
 書き込み後、PC の Bluetooth 設定でデバイスをペアリングしてください。
+**StickS3への書き込みでは環境を明示してください。** `default_envs` はCoreS3のままなので、
+`-e` を省略するとCoreS3用ファームになります。
+
+```bash
+pio run -e m5stack-sticks3 -t upload
+```
+
+StickS3用のイメージは `.pio\build\m5stack-sticks3\firmware.bin` です。
+診断画面の先頭には `StickS3 BMI270` と表示されます。
 
 ## コントロール
 
@@ -90,9 +99,18 @@ CoreS3 と **ネイティブ軸が異なります**。StickS3 の `+X` は USB-C
 
 ### StickS3 の操作上の注意
 
-起動後は机などで約1秒静止し、`Calibrating...` が消えるのを待ってください。
-動いている間は校正を再試行します。画面には BLE、校正／PAUSED／SCROLL／DRAG、実取得Hz、
-一時的な LEFT／RIGHT／MIDDLE クリック表示を出します。
+起動後は机などで約1秒静止し、`Calibrating` が消えるのを待ってください。
+校正は **1回最大1.5秒、3回まで（通常のサンプリング中は最大約4.5秒）**です。
+画面の `Calibrating 1/3 1.5s` は試行番号とその試行の残り時間です。ノイズや動きがあっても
+タイマーを巻き戻しません。200サンプル以上・1秒以上を取得し、各軸の標準偏差が
+ジャイロ0.8°/秒以下／加速度0.04g以下、平均角速度ノルム5°/秒以下、平均加速度が1±0.15gなら完了します。
+
+3回とも失敗した場合は、取得済みの試行のうち加速度とジャイロの変動が小さい平均バイアスを使って
+移動を開始し、**`CAL:WARN best bias`** を表示し続けます。選択スコアはジャイロ各軸分散の和
+＋100×加速度各軸分散の和＋10×平均加速度ノルムの1gからの差です。
+動き続けたままの校正値は不正確なことがあります。警告が出たら、本体を静止させてリセットすると再校正できます。
+取得ゼロ・非有限値・加速度ゼロなどは成功扱いにせず、`NO VALID DATA`／`NO SAMPLES` を表示します。
+データが回復すれば校正を再開します。CoreS3 の起動校正の条件は変更していません。
 
 BtnA のドラッグは **押している間だけ**です。押し始めはカーソルを止め、450msでドラッグへ移行し、
 さらに150msの押下振動抑制後に移動できます。離すと左ボタンを解放し、150ms停止します。
@@ -105,6 +123,49 @@ BtnB 長押し中は横移動も縦移動も送らず、バイアス補正／ロ
 ポインタと同じ静止域・軽い平滑化を使い、ホイールには速度加速を掛けません。
 小数を保持して8msごとに整数分を送り、モード切替時は残量を破棄します。
 スクロール開始・終了およびすべてのクリック後に150ms停止します。
+
+### StickS3 の内部IMU経路と停止診断
+
+アプリは **内蔵BMI270と物理ボタンだけ**で動作し、HAT／Unitは不要です。
+`config.internal_imu=true`、`config.external_imu=false` で `M5.begin(config)` を呼び、
+M5Unified が初期化した `M5.Imu`／`M5.In_I2C` を使います。アプリでI2Cピンやアドレスを指定しません。
+
+M5Unified 0.2.20 の根拠:
+
+| 確認項目 | ソースと結果 |
+|---|---|
+| 内部バス | [M5Unified.cpp のピン表](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/M5Unified.cpp#L84-L92)は **SCL,SDA** の順なので、内部SCL48／SDA47で正しい。外部GroveのSCL10／SDA9とは別 |
+| 初期化 | [内部I2C1の設定](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/M5Unified.cpp#L1842-L1887)、[internal_imu分岐](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/M5Unified.cpp#L3049-L3056)、[BMI270の0x69→0x68探索](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/utility/IMU_Class.cpp#L74-L120)。同じドライバの選択済みアドレスにアクセス |
+| 設定・単位 | [IMU_Base.hpp](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/utility/imu/IMU_Base.hpp#L50-L59)は8/32768 g、2000/32768 dps。[Bosch定義](https://github.com/boschsensortec/BMI270_SensorAPI/blob/master/bmi2_defs.h)でもAA/02/EA/00は400Hz・通常帯域・性能優先・±8g／±2000dps。設定と換算は一致しているため維持 |
+| 新しいデータ | [BMI270_Class.cpp](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/utility/imu/BMI270_Class.cpp#L121-L157)はINT_STATUS_1のaccel=0x80、gyro=0x40から鮮度マスクを返す。[IMU_Class::update](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/utility/IMU_Class.cpp#L413-L449)の戻り値を使う。内部タイムスタンプの更新だけでは鮮度を保証しない |
+| 磁気センサーなし | [BMI270_Class.cpp のAUX初期化](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/utility/imu/BMI270_Class.cpp#L74-L100)でBMM150が見つからなくてもPWR_CTRL=0x0Eで加速度・ジャイロは有効。磁気データを待つ処理はない |
+| 初期化結果の弱点 | [BMI270_Class.cpp](https://github.com/m5stack/M5Unified/blob/774d920cd6851a5231748b56ece1b073645f313f/src/utility/imu/BMI270_Class.cpp#L19-L86)は初期化完了の判定結果を失敗として返し切らない。アプリはisEnabled／typeに加えCHIP_ID=0x24、INTERNAL_STATUSのinit_ok、ACC/GYR電源、ERR_REGのfatal/configビットを確認する |
+
+旧StickS3の停止条件として、厳しい校正条件（0.25°/秒、0.015g、1±0.06g）を満たせず
+`calibrated=false` のまま無期限に待つ経路を数値テストで再現しました。
+これを上記の期限付き校正に置き換えています。ただし、個々の実機がこの条件で止まっていたかは
+実機の取得値なしには断定できません。ピン誤りやレンジ不一致が見つかったわけではありません。
+
+`TARGET_M5STICKS3` の専用タスクで2ms周期に読み、鮮度マスク付きのgyroと30ms以内のaccelだけを処理します。
+I2C処理が遅れたときは追いつくための連続ループを避け、最低1tick待ってボタン／BLE側へCPUを渡します。
+画面描画・BLE送信・シリアル出力はIMU mutexの外で行います。
+初期化エラー時も診断画面とBLEボタンクリックを動かし、IMU移動だけを無効にします。
+起動時の一時停止はOFFで、3gのシェイク・150msのクリック凍結・BLE接続判定は従来どおりです。
+
+診断画面は200msごとに更新します。値は次の意味です。
+
+| 表示 | 意味 |
+|---|---|
+| `StickS3 BMI270 OK`, `ID`, `@`, `TYPE` | 対象機種、データ取得状態、チップID（24）、選択アドレス（68）、M5Unifiedのtype番号 |
+| `I2C`, `SDA`, `SCL` | M5Unifiedの実際の内部バス／ピン |
+| `IN`, `ER`, `P`, `CFG` | 起動時のINTERNAL_STATUS／ERR_REG／PWR_CTRLと4設定バイト（正常例01／00／0E、AA/02/EA/00）。AUX/FIFOエラーだけでは加速度・ジャイロを停止しない |
+| `BLE`, `Hz`, `G`, `A` | BLE接続状態、有効サンプルHz、gyro／accelそれぞれの実取得Hz（直近約1秒） |
+| `Gyro dps (native)` | ソフトウェアバイアスを引く前のネイティブX/Y/Z角速度。共通フレームに変換する前の値 |
+| `Bias dps (native)` | 現在のバイアスを同じネイティブ軸へ戻した値 |
+| `Accel`, `Age` | 加速度ノルム（g）、最後の有効サンプルからの経過ms。静止時は概ね1g |
+| `Paused`, `Freeze`, `GATE` | 一時停止と短時間凍結を個別表示。GATEは取得不良・校正・BLE待ち・PAUSED・FREEZE・READYのどれが出力を止めているかを示す |
+| `A`, `B`, `DRAG`, `CLK` | 物理押下、ドラッグ保持、直近のクリック |
+| `TX`, `Read`, `Lock`, `Late` | BLEライブラリへ渡した移動レポート数（PC側受信の保証ではない）、起動以降の最長IMU読み取り時間／mutex待ち時間、遅延ポーリング回数 |
 
 ### 電源ボタンは変更しません
 
@@ -132,6 +193,14 @@ M5Unified の通常のボード初期化は使用しますが、`config.pmic_but
 | `src/StickMouse.cpp` | `kDisplayBrightness` | 90 |
 | `include/AirMouse.h` | `kScrollStepsPerDegree` | 0.35 |
 | `include/AirMouse.h` | `kScrollSign` | +1 |
+| `include/StickCalibration.h` | `kMinimumDurationUs` | 1000000µs |
+| `include/StickCalibration.h` | `kAttemptDurationUs` | 1500000µs |
+| `include/StickCalibration.h` | `kMinimumSamples` | 200 |
+| `include/StickCalibration.h` | `kMaximumAttempts` | 3 |
+| `include/StickCalibration.h` | `kGyroStdDevDps` | 0.8°/秒（各軸） |
+| `include/StickCalibration.h` | `kAccelStdDevG` | 0.04g（各軸） |
+| `include/StickCalibration.h` | `kGravityToleranceG` | 0.15g |
+| `include/StickCalibration.h` | `kMaximumMeanRateDps` | 5.0°/秒 |
 
 ## CoreS3 の空中マウス
 
@@ -217,7 +286,8 @@ CoreS3 の BMM150 の補正済み磁気方位は引き続き `MAG` に表示し�
 ### 共通ジャイロの全調整定数
 
 `include/AirMouse.h` を変更して再ビルドします。角速度は度/秒、移動感度は HID カウント/度です。
-両機種が同じ計算・既定値を使用します。ここで感度や符号を変更すると両方に適用されます。
+移動計算は両機種で共通です。ここで感度や符号を変更すると両方に適用されます。
+以下の `kCalibration*` はCoreS3の起動校正用で、StickS3は上記 `StickCalibration.h` の条件を使います。
 CoreS3 の既定のポインタ計算・タッチ操作は変更していません。
 
 | 定数 | 既定値 | 用途 |
@@ -237,7 +307,7 @@ CoreS3 の既定のポインタ計算・タッチ操作は変更していませ�
 | `kCalibrationMaxRateDps` | 5.0 | 校正中の最大角速度ノルム |
 | `kCalibrationGyroStdDevDps` | 0.25 | 校正時の各軸標準偏差上限 |
 | `kCalibrationAccelStdDevG` | 0.015g | 校正時の加速度各軸標準偏差上限 |
-| `kSteadyGravityToleranceG` | 0.06g | 校正・バイアス追従の静止判定 |
+| `kSteadyGravityToleranceG` | 0.06g | CoreS3起動校正・両機種のバイアス追従の静止判定 |
 | `kSteadyAccelDeltaG` | 0.025g | 追従時の加速度サンプル間差の上限 |
 | `kBiasTrackingMaxRateDps` | 1.5 | 追従を許す補正後角速度ノルム |
 | `kBiasStillTimeUs` | 500000 | 追従前の静止継続時間 |
@@ -319,6 +389,9 @@ LCD 表示の回転に依存しません。`src/utility/imu/BMI270_Class.cpp` �
 バイアス追従、ソフトニー、可変 dt、小数・±127 超過分の保持、クリック凍結、切断、シェイク、
 時刻周回、ホイール積分を入力します。`StickButtons.h` も単押し・二度押し・長押し・
 切断中のクリック破棄・ボタン保持中の再接続・時計周回を同じ実装で検査します。
+`StickCalibration.h` の期限付き校正も同じ実装で実行します。旧無期限停止の再現、
+ノイズ許容、3試行後の最良平均選択、取得ゼロ／非有限値、復帰、時刻周回、回転し続けた場合の
+警告付き復帰を含む18グループです。実機のI2C信号やBLE受信を代替するテストではありません。
 
 ```powershell
 g++ -std=c++14 -Wall -Wextra -Werror -pedantic tests\air_mouse_test.cpp -o air_mouse_test.exe

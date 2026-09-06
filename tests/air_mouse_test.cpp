@@ -1,5 +1,6 @@
 #include "../include/AirMouse.h"
 #include "../include/StickButtons.h"
+#include "../include/StickCalibration.h"
 #include <cassert>
 #include <cstdio>
 
@@ -408,6 +409,100 @@ void testStickDisconnectAndWrap() {
   assert(a.middleClick && !a.rightClick);
 }
 
+void testBoundedCalibrationNoise() {
+  const Vec3 accelerations[] = {{0, 0, 1}, {0, 0, 1.08f}};
+  for (const auto accel : accelerations) {
+    Controller strict, fixed;
+    stick_calibration::Calibration boot;
+    uint32_t now = 10000;
+    boot.begin(now);
+    strict.setInput(false, true, now);
+    fixed.setInput(false, true, now);
+    for (int i = 0; i < 4800; ++i) {
+      now += 2500;
+      const Vec3 gyro(0.3f + (i % 2 ? 0.5f : -0.5f), -0.2f, 0.4f);
+      strict.sample(gyro, accel, now);
+      boot.add(gyro, accel);
+      boot.poll(now);
+      if (i >= 399) {
+        assert(boot.ready);
+      }
+    }
+    assert(!strict.calibrated && strict.pending.x == 0);  // Reproduce the old permanent gate.
+    assert(!boot.degraded && near(boot.bias.x, 0.3f, 0.002f));
+    fixed.bias = boot.bias;
+    fixed.gravity = boot.gravity;
+    fixed.calibrated = true;
+    assert(!fixed.freezeActive(now));
+    for (int i = 0; i < 400; ++i) {
+      fixed.sample(boot.bias + Vec3(0, 0, -20), accel, now += 2500);
+    }
+    assert(fixed.pending.x > 400);
+    fixed.clearMotion();
+    fixed.sample(boot.bias, accel, now += 2500);
+    assert(fixed.pending.x == 0 && fixed.pending.y == 0);
+    fixed.freeze(now);
+    assert(fixed.freezeActive(now));
+    assert(!fixed.freezeActive(now + kTouchFreezeUs));
+  }
+}
+
+void testBoundedCalibrationFallback() {
+  stick_calibration::Calibration boot;
+  uint32_t now = 10000;
+  boot.begin(now);
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const float noise = attempt == 1 ? 2.0f : 4.0f;
+    const float bias = attempt == 1 ? 0.3f : 1.0f;
+    for (int i = 0; i < 600; ++i) {
+      boot.add({bias + (i % 2 ? noise : -noise), 0, 0}, {0, 0, 1});
+      boot.poll(now += 2500);
+    }
+    assert(boot.failedAttempts == static_cast<uint32_t>(attempt + 1));
+  }
+  assert(boot.ready && boot.degraded && near(boot.bias.x, 0.3f));
+  assert(boot.remainingUs(now) == 0);
+}
+
+void testBoundedCalibrationMissingAndWrap() {
+  stick_calibration::Calibration boot;
+  uint32_t now = UINT32_MAX - 500000;
+  boot.begin(now);
+  assert(boot.remainingUs(now) == stick_calibration::kAttemptDurationUs);
+  for (int i = 0; i < 3; ++i) {
+    boot.poll(now += stick_calibration::kAttemptDurationUs);
+  }
+  assert(!boot.ready && boot.noData());
+  for (int i = 0; i < 400; ++i) {
+    boot.add({0.4f, 0, 0}, {0, 0, 1});
+    boot.poll(now += 2500);
+  }
+  assert(boot.ready && !boot.degraded && near(boot.bias.x, 0.4f));
+  boot.begin(now);
+  for (int i = 0; i < 30; ++i) {
+    boot.add({}, {});  // Invalid accelerometer output must not fabricate a calibration.
+    boot.poll(now += 150000);
+  }
+  assert(!boot.ready && boot.noData());
+}
+
+void testBoundedCalibrationTumbling() {
+  stick_calibration::Calibration boot;
+  uint32_t now = 10000;
+  boot.begin(now);
+  for (int i = 0; i < 1800; ++i) {
+    boot.add({i % 2 ? 20.0f : -20.0f, 0, 0}, {0, 0, i % 2 ? 1.0f : -1.0f});
+    boot.poll(now += 2500);
+  }
+  assert(boot.ready && boot.degraded && air_mouse::length(boot.gravity) > 0.9f);
+  boot.begin(now);
+  for (int i = 0; i < 1800; ++i) {
+    boot.add({std::numeric_limits<float>::quiet_NaN(), 0, 0}, {0, 0, 1});
+    boot.poll(now += 2500);
+  }
+  assert(!boot.ready && boot.noData());
+}
+
 int main() {
   testDirections();
   testCalibration();
@@ -423,5 +518,9 @@ int main() {
   testStickRightAndMiddle();
   testStickScrollButtons();
   testStickDisconnectAndWrap();
-  std::puts("Shared air mouse: 14 deterministic test groups passed");
+  testBoundedCalibrationNoise();
+  testBoundedCalibrationFallback();
+  testBoundedCalibrationMissingAndWrap();
+  testBoundedCalibrationTumbling();
+  std::puts("Shared air mouse: 18 deterministic test groups passed");
 }
