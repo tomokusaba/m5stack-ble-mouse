@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace core_air_mouse {
+namespace air_mouse {
 
 constexpr uint32_t kImuPollMs = 2;
 constexpr uint32_t kReportIntervalUs = 8000;
@@ -35,11 +35,15 @@ constexpr float kShakeThresholdG = 3.0f;
 constexpr uint32_t kShakeSamples = 2;
 constexpr uint32_t kShakeCooldownUs = 1200000;
 constexpr uint32_t kShakeQuietUs = 400000;
+constexpr float kScrollStepsPerDegree = 0.35f;
+constexpr int kScrollSign = 1;
 
 static_assert(kCursorXSign == 1 || kCursorXSign == -1, "Invalid X sign");
 static_assert(kCursorYSign == 1 || kCursorYSign == -1, "Invalid Y sign");
 static_assert(kRateFilterAlpha >= 0.5f && kRateFilterAlpha <= 1.0f, "Use a light filter");
 static_assert(kPixelsPerDegree > 0 && kRateKneeDps > 0, "Invalid motion gain");
+static_assert(kScrollSign == 1 || kScrollSign == -1, "Invalid scroll sign");
+static_assert(kScrollStepsPerDegree > 0, "Invalid scroll gain");
 
 struct Vec3 {
   float x = 0, y = 0, z = 0;
@@ -49,6 +53,11 @@ struct Vec3 {
   Vec3 operator-(Vec3 b) const { return {x - b.x, y - b.y, z - b.z}; }
   Vec3 operator*(float s) const { return {x * s, y * s, z * s}; }
 };
+
+// StickS3 native +X points to USB, +Y to screen right, +Z out of the screen.
+inline Vec3 stickToPointerFrame(Vec3 native) {
+  return {native.y, -native.x, native.z};
+}
 
 inline float dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 inline float length(Vec3 v) { return std::sqrt(dot(v, v)); }
@@ -92,13 +101,13 @@ inline float softenRate(float rate) {
 }
 
 struct PixelAccumulator {
-  float x = 0, y = 0;
+  float x = 0, y = 0, wheel = 0;
   static int take(float& value) {
     const int delta = static_cast<int>(std::max(-127.0f, std::min(127.0f, value)));
     value -= delta;
     return delta;
   }
-  void clear() { x = y = 0; }
+  void clear() { x = y = wheel = 0; }
 };
 
 struct Moments {
@@ -125,6 +134,13 @@ class Controller {
   uint32_t calibrationRetries = 0;
   Vec3 bias, gravity;
   PixelAccumulator pending;
+
+  void setScrollMode(bool enabled) {
+    if (scrollMode_ != enabled) {
+      clearMotion();
+    }
+    scrollMode_ = enabled;
+  }
 
   void clearMotion() {
     pending.clear();
@@ -230,8 +246,12 @@ class Controller {
     const float rate = std::sqrt(rates.yaw * rates.yaw + rates.pitch * rates.pitch);
     const float gain = kPixelsPerDegree *
                        (1.0f + kAcceleration * std::min(rate / kAccelerationFullScaleDps, 1.0f));
-    pending.x += kCursorXSign * gain * filteredYaw_ * dt;
-    pending.y += kCursorYSign * gain * filteredPitch_ * dt;
+    if (scrollMode_) {
+      pending.wheel += kScrollSign * kScrollStepsPerDegree * filteredPitch_ * dt;
+    } else {
+      pending.x += kCursorXSign * gain * filteredYaw_ * dt;
+      pending.y += kCursorYSign * gain * filteredPitch_ * dt;
+    }
   }
 
  private:
@@ -242,6 +262,7 @@ class Controller {
   float filteredYaw_ = 0, filteredPitch_ = 0;
   bool hasSample_ = false, connected_ = false, interacting_ = false;
   bool hasInteraction_ = false, hasShaken_ = false, shakeArmed_ = true;
+  bool scrollMode_ = false;
 
   void resetCalibrationWindow() {
     if (gyroWindow_.count != 0) {
@@ -307,4 +328,4 @@ class Controller {
   }
 };
 
-}  // namespace core_air_mouse
+}  // namespace air_mouse

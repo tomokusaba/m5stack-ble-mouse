@@ -1,8 +1,9 @@
-#include "../include/CoreAirMouse.h"
+#include "../include/AirMouse.h"
+#include "../include/StickButtons.h"
 #include <cassert>
 #include <cstdio>
 
-using namespace core_air_mouse;
+using namespace air_mouse;
 
 bool near(float a, float b, float tolerance = 0.001f) {
   return std::fabs(a - b) <= tolerance;
@@ -243,6 +244,170 @@ void testClockWrap() {
   assert(!c.blocked(interactionTime));  // Same counter value one full wrap later.
 }
 
+void testStickAxesAndParity() {
+  const Vec3 up = stickToPointerFrame({0, 0, 1});
+  const auto right = projectRates(stickToPointerFrame({0, 0, -20}), up, true);
+  const auto raise = projectRates(stickToPointerFrame({0, 20, 0}), up, true);
+  const auto roll = projectRates(stickToPointerFrame({-20, 0, 0}), up, true);
+  assert(kCursorXSign * right.yaw > 0 && near(right.pitch, 0));
+  assert(kCursorYSign * raise.pitch < 0 && near(raise.yaw, 0));
+  assert(near(roll.yaw, 0) && near(roll.pitch, 0));
+  const auto fallback = projectRates(stickToPointerFrame({99, 12, -20}), {0, 0, 2}, false);
+  assert(near(fallback.yaw, -20) && near(fallback.pitch, 12));
+
+  for (int degrees = -180; degrees <= 180; degrees += 15) {
+    const float a = degrees * 3.14159265359f / 180.0f;
+    const Vec3 nativeUp(0, -std::sin(a), std::cos(a));
+    const Vec3 nativeRight(0, std::cos(a), std::sin(a));
+    const auto yaw = projectRates(stickToPointerFrame(nativeUp * -20),
+                                  stickToPointerFrame(nativeUp), true);
+    const auto pitch = projectRates(stickToPointerFrame(nativeRight * 20),
+                                    stickToPointerFrame(nativeUp), true);
+    assert(near(yaw.yaw, -20) && near(yaw.pitch, 0));
+    assert(near(pitch.pitch, 20) && near(pitch.yaw, 0));
+  }
+  Controller core, stick;
+  const Vec3 nativeBias(0.2f, -0.3f, 0.4f);
+  const Vec3 pointerBias = stickToPointerFrame(nativeBias);
+  uint32_t now = calibrate(core, pointerBias);
+  calibrate(stick, pointerBias);
+  for (int i = 0; i < 2000; ++i) {
+    const Vec3 nativeGyro = nativeBias + Vec3(0, i % 2 ? 12 : -5, -20);
+    const Vec3 pointerGyro(nativeGyro.y, -nativeGyro.x, nativeGyro.z);
+    now += i % 2 ? 2000 : 3000;
+    core.sample(pointerGyro, {0, 0, 1}, now);
+    stick.sample(stickToPointerFrame(nativeGyro), stickToPointerFrame({0, 0, 1}), now);
+    assert(core.pending.x == stick.pending.x && core.pending.y == stick.pending.y);
+    assert(core.pending.wheel == 0 && stick.pending.wheel == 0);
+  }
+}
+
+void testGyroScroll() {
+  Controller c;
+  uint32_t now = calibrate(c);
+  c.sample({0, 0, -20}, {0, 0, 1}, now += 2500);
+  assert(c.pending.x > 0);
+  c.setScrollMode(true);
+  assert(c.pending.x == 0 && c.pending.y == 0);
+  for (int i = 0; i < 400; ++i) {
+    c.sample(stickToPointerFrame({0, 20, -30}), {0, 0, 1}, now += 2500);
+  }
+  assert(c.pending.x == 0 && c.pending.y == 0);
+  assert(near(c.pending.wheel, kScrollStepsPerDegree * softenRate(20), 0.02f));
+  const float total = c.pending.wheel;
+  for (int i = 0; i < 100; ++i) {
+    c.sample({}, stickToPointerFrame({0.6f, 0, 0.8f}), now += 2500);
+  }
+  assert(c.pending.wheel == total);  // Static tilt never scrolls either.
+  int sent = PixelAccumulator::take(c.pending.wheel);
+  assert(sent > 0 && near(sent + c.pending.wheel, total));
+  c.freeze(now);
+  assert(c.pending.wheel == 0);
+  c.sample({20, 0, 0}, {0, 0, 1}, now += 2500);
+  assert(c.pending.wheel == 0);
+  for (int i = 0; i < 100; ++i) {
+    c.sample({-20, 0, 0}, {0, 0, 1}, now += 2500);
+  }
+  assert(c.pending.wheel < 0);
+  c.setScrollMode(false);
+  assert(c.pending.wheel == 0);
+  c.sample({0, 0, -20}, {0, 0, 1}, now += 2500);
+  assert(c.pending.x > 0 && c.pending.wheel == 0);
+  c.setScrollMode(true);
+  c.pointingEnabled = false;
+  c.sample({20, 0, 0}, {0, 0, 1}, now += 2500);
+  assert(c.pending.wheel == 0);
+}
+
+void testStickClickAndDrag() {
+  stick_buttons::Controller b;
+  auto a = b.update(true, false, true, 0);
+  assert(!a.leftClick && !a.leftHeld && a.freezePointer);
+  a = b.update(false, false, true, 100);
+  assert(a.leftClick && !a.leftHeld);
+  a = b.update(false, false, true, 105);
+  assert(!a.leftClick);
+  b.update(true, false, true, 200);
+  a = b.update(true, false, true, 200 + stick_buttons::kDragHoldMs);
+  assert(a.leftHeld && !a.freezePointer);
+  a = b.update(false, false, true, 700);
+  assert(!a.leftHeld && !a.leftClick);
+  b.update(true, false, true, 800);
+  a = b.update(false, false, true, 1400);
+  assert(!a.leftClick);  // A stalled input poll must not turn a long press into a click.
+}
+
+void testStickRightAndMiddle() {
+  stick_buttons::Controller b;
+  b.update(false, true, true, 0);
+  auto a = b.update(false, false, true, 50);
+  assert(!a.rightClick && !a.middleClick);
+  a = b.update(false, false, true, 349);
+  assert(!a.rightClick);
+  a = b.update(false, false, true, 350);
+  assert(a.rightClick && !a.middleClick);
+  assert(!b.update(false, false, true, 355).rightClick);
+  b.update(false, true, true, 400);
+  b.update(false, false, true, 450);
+  b.update(false, true, true, 600);
+  a = b.update(false, false, true, 650);
+  assert(a.middleClick && !a.rightClick);
+  a = b.update(false, false, true, 1000);
+  assert(!a.middleClick && !a.rightClick);
+  // A's drag stays held through a B click.
+  b.update(true, false, true, 1100);
+  b.update(true, true, true, 1600);
+  b.update(true, false, true, 1650);
+  a = b.update(true, false, true, 1950);
+  assert(a.leftHeld && a.rightClick);
+}
+
+void testStickScrollButtons() {
+  stick_buttons::Controller b;
+  b.update(false, true, true, 0);
+  auto a = b.update(false, true, true, 349);
+  assert(!a.scroll && a.freezePointer);
+  a = b.update(false, true, true, 350);
+  assert(a.scroll && !a.freezePointer);
+  a = b.update(false, false, true, 500);
+  assert(!a.scroll && !a.rightClick && !a.middleClick);
+  assert(!b.update(false, false, true, 900).rightClick);
+  // A pending short B click is cancelled by a following scroll hold.
+  b.update(false, true, true, 1000);
+  b.update(false, false, true, 1050);
+  b.update(false, true, true, 1100);
+  a = b.update(false, true, true, 1450);
+  assert(a.scroll && !a.rightClick);
+  b.update(false, false, true, 1500);
+  assert(!b.update(false, false, true, 1900).rightClick);
+  b.update(false, true, true, 2000);
+  b.update(false, false, true, 2400);
+  assert(!b.update(false, false, true, 2800).rightClick);
+}
+
+void testStickDisconnectAndWrap() {
+  stick_buttons::Controller b;
+  b.update(true, false, true, 0);
+  assert(b.update(true, false, true, 500).leftHeld);
+  assert(!b.update(true, false, false, 510).leftHeld);
+  auto a = b.update(true, false, true, 1000);
+  assert(!a.leftHeld && a.freezePointer);  // Reconnect never resumes a held button.
+  assert(!b.update(false, false, true, 1100).leftClick);
+  b.update(false, true, true, 1200);
+  b.update(false, false, true, 1250);
+  b.update(false, false, false, 1260);
+  assert(!b.update(false, false, true, 2000).rightClick);
+  const uint32_t start = UINT32_MAX - 100;
+  b.update(true, false, true, start);
+  assert(b.update(true, false, true, start + 450U).leftHeld);
+  b.update(false, false, true, start + 500U);
+  b.update(false, true, true, UINT32_MAX - 80);
+  b.update(false, false, true, UINT32_MAX - 50);
+  b.update(false, true, true, 50);
+  a = b.update(false, false, true, 100);
+  assert(a.middleClick && !a.rightClick);
+}
+
 int main() {
   testDirections();
   testCalibration();
@@ -252,5 +417,11 @@ int main() {
   testFreezeDisconnectAndGap();
   testShake();
   testClockWrap();
-  std::puts("CoreS3 air mouse: 8 deterministic test groups passed");
+  testStickAxesAndParity();
+  testGyroScroll();
+  testStickClickAndDrag();
+  testStickRightAndMiddle();
+  testStickScrollButtons();
+  testStickDisconnectAndWrap();
+  std::puts("Shared air mouse: 14 deterministic test groups passed");
 }

@@ -3,14 +3,16 @@
 #include <BleMouse.h>
 
 #if defined(TARGET_M5STACK_CORES3)
-#include "CoreAirMouse.h"
+#include "AirMouse.h"
+#include "AirMouseImu.h"
 #include <freertos/semphr.h>
-#include <utility/imu/BMI270_Class.hpp>
 #endif
 
 #if !defined(TARGET_M5STICKS3) && !defined(TARGET_M5STACK_CORES3)
 #error "Select m5stack-sticks3 or m5stack-cores3 in PlatformIO."
 #endif
+
+#if defined(TARGET_M5STACK_CORES3)
 
 namespace {
 
@@ -20,144 +22,7 @@ int clampHidDelta(int value) {
   return constrain(value, -127, 127);
 }
 
-#if defined(TARGET_M5STICKS3)
-
-constexpr float kStickDeadzoneDeg = 1.2f;
-constexpr float kStickSensitivity = 7.0f;
-constexpr float kStickVerticalSensitivityMultiplier = 1.75f;
-constexpr float kStickFilterAlpha = 0.12f;
-constexpr float kStickVelocitySmoothing = 0.18f;
-constexpr uint32_t kStickMotionIntervalMs = 8U;
-constexpr int kStickCursorXSign = 1;
-constexpr int kStickCursorYSign = -1;
-
-static_assert(kStickCursorXSign == -1 || kStickCursorXSign == 1);
-static_assert(kStickCursorYSign == -1 || kStickCursorYSign == 1);
-
-struct StickPointerState {
-  float filteredHorizontalTilt = 0.0f;
-  float filteredVerticalTilt = 0.0f;
-  float previousHorizontalTilt = 0.0f;
-  float previousVerticalTilt = 0.0f;
-  float smoothX = 0.0f;
-  float smoothY = 0.0f;
-};
-
-StickPointerState stickPointer;
-BleMouse bleMouse("M5StickS3 IMU Mouse");
-uint32_t lastStickMotionMs = 0;
-uint32_t stickButtonPressedMs = 0;
-bool stickButtonDragHeld = false;
-
-float clampFloat(float value, float minimum, float maximum) {
-  return value < minimum ? minimum : (value > maximum ? maximum : value);
-}
-
-float stickAxisVelocity(float current, float previous, float multiplier = 1.0f) {
-  const float delta = current - previous;
-  const float magnitude = fabsf(delta);
-  if (magnitude <= kStickDeadzoneDeg) {
-    return 0.0f;
-  }
-
-  const float normalized = clampFloat((magnitude - kStickDeadzoneDeg) / 18.8f, 0.0f, 1.0f);
-  const float gain = kStickSensitivity * multiplier * (0.9f + normalized * 2.1f);
-  return copysignf(clampFloat(powf(magnitude, 0.95f) * 0.58f * gain, 0.0f, 24.0f), delta);
-}
-
-void updateStickPointer() {
-  float ax = 0.0f;
-  float ay = 0.0f;
-  float az = 0.0f;
-  M5.Imu.getAccelData(&ax, &ay, &az);
-
-  const float horizontalTilt = atan2f(-ay, ax) * 180.0f / PI;
-  const float verticalTilt = atan2f(az, sqrtf(ax * ax + ay * ay)) * 180.0f / PI;
-  stickPointer.filteredHorizontalTilt +=
-      (horizontalTilt - stickPointer.filteredHorizontalTilt) * kStickFilterAlpha;
-  stickPointer.filteredVerticalTilt +=
-      (verticalTilt - stickPointer.filteredVerticalTilt) * kStickFilterAlpha;
-
-  const float targetX = kStickCursorXSign * stickAxisVelocity(
-      stickPointer.filteredHorizontalTilt, stickPointer.previousHorizontalTilt);
-  const float targetY = kStickCursorYSign * stickAxisVelocity(
-      stickPointer.filteredVerticalTilt, stickPointer.previousVerticalTilt,
-      kStickVerticalSensitivityMultiplier);
-  stickPointer.smoothX += (targetX - stickPointer.smoothX) * kStickVelocitySmoothing;
-  stickPointer.smoothY += (targetY - stickPointer.smoothY) * kStickVelocitySmoothing;
-
-  if (bleMouse.isConnected() &&
-      (fabsf(stickPointer.smoothX) > 0.05f || fabsf(stickPointer.smoothY) > 0.05f)) {
-    bleMouse.move(static_cast<signed char>(clampHidDelta(roundf(stickPointer.smoothX))),
-                  static_cast<signed char>(clampHidDelta(roundf(stickPointer.smoothY))));
-  }
-
-  stickPointer.previousHorizontalTilt = stickPointer.filteredHorizontalTilt;
-  stickPointer.previousVerticalTilt = stickPointer.filteredVerticalTilt;
-}
-
-void updateStickButton() {
-  if (M5.BtnA.wasPressed()) {
-    stickButtonPressedMs = millis();
-    stickButtonDragHeld = false;
-  }
-  if (M5.BtnA.isPressed() && !stickButtonDragHeld &&
-      millis() - stickButtonPressedMs >= kClickThresholdMs) {
-    bleMouse.press(MOUSE_LEFT);
-    stickButtonDragHeld = true;
-  }
-  if (M5.BtnA.wasReleased()) {
-    if (stickButtonDragHeld) {
-      bleMouse.release(MOUSE_LEFT);
-    } else if (millis() - stickButtonPressedMs < kClickThresholdMs) {
-      bleMouse.click(MOUSE_LEFT);
-    }
-  }
-}
-
-void drawStickStatus() {
-  M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(8, 8);
-  M5.Display.printf("BLE IMU Mouse\n");
-  M5.Display.setCursor(8, 36);
-  M5.Display.printf("Conn: %s\n", bleMouse.isConnected() ? "YES" : "NO");
-}
-
-}  // namespace
-
-void setup() {
-  auto config = M5.config();
-  config.internal_imu = true;
-  M5.begin(config);
-  M5.Display.setBrightness(90);
-  M5.Display.fillScreen(TFT_BLACK);
-  if (!M5.Imu.isEnabled() && !M5.Imu.begin()) {
-    M5.Display.println("IMU init failed");
-    while (true) {
-      delay(1000);
-    }
-  }
-
-  bleMouse.begin();
-  drawStickStatus();
-}
-
-void loop() {
-  M5.update();
-  updateStickButton();
-
-  if (millis() - lastStickMotionMs >= kStickMotionIntervalMs) {
-    lastStickMotionMs = millis();
-    updateStickPointer();
-  }
-  drawStickStatus();
-  delay(8);
-}
-
-#else
-
-namespace air = core_air_mouse;
+namespace air = air_mouse;
 constexpr uint32_t kTouchPollUs = 5000;
 constexpr uint32_t kStatusIntervalMs = 200;
 
@@ -217,27 +82,7 @@ void coreFatal(const char* message) {
 }
 
 bool configureCoreImu() {
-  using Bmi = m5::BMI270_Class;
-  auto* sensor = M5.Imu.getImuInstancePtr(0);
-  if (!sensor || M5.Imu.getType() != m5::imu_bmi270) {
-    return false;
-  }
-  // Bosch ACC_CONF/GYR_CONF: 400Hz, normal bandwidth, performance mode.
-  // Preserve the 8g / 2000dps ranges used by M5Unified's conversion factors.
-  const uint8_t config[] = {0xAA, 0x02, 0xEA, 0x00};
-  uint8_t actual[sizeof(config)] = {};
-  if (!sensor->writeRegister(Bmi::ACC_CONF_ADDR, config, sizeof(config)) ||
-      !sensor->readRegister(Bmi::ACC_CONF_ADDR, actual, sizeof(actual)) ||
-      memcmp(config, actual, sizeof(config)) != 0) {
-    return false;
-  }
-  M5.Imu.setCalibration(0, 0, 0);
-  // Do not inherit a one-sample/NVS gyro bias; the new pipeline calibrates at rest.
-  for (size_t index = 3; index < 6; ++index) {
-    M5.Imu.setOffsetData(index, 0);
-  }
-  return M5.Imu.setAxisOrder(m5::IMU_Class::axis_x_pos, m5::IMU_Class::axis_y_pos,
-                             m5::IMU_Class::axis_z_pos);
+  return configureAirMouseImu();
 }
 
 void sampleAirMouseTask(void*) {
